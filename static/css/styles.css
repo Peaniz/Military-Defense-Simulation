@@ -1,0 +1,124 @@
+/* Main styles for Radar Application */
+
+body {
+    background-color: #121212;
+    font-family: 'Arial', sans-serif;
+}
+
+/* Canvas styling */
+#radar-canvas {
+    background-color: #000;
+    border-radius: 4px;
+}
+
+/* Card styling */
+.card {
+    border: 1px solid #2a623d;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.card-header {
+    border-bottom: 1px solid #2a623d;
+}
+
+.card-footer {
+    border-top: 1px solid #2a623d;
+}
+
+/* Button styling */
+.btn-outline-warning {
+    border-color: #ffc107;
+    color: #ffc107;
+}
+
+.btn-outline-warning:hover {
+    background-color: #ffc107;
+    color: #000;
+}
+
+.btn-outline-primary {
+    border-color: #0d6efd;
+    color: #0d6efd;
+}
+
+.btn-outline-primary:hover {
+    background-color: #0d6efd;
+    color: #fff;
+}
+
+/* Camera feed container */
+.camera-container {
+    position: relative;
+    width: 100%;
+    background-color: #000;
+    border-radius: 4px;
+}
+
+/* System message styling */
+#system-message {
+    background-color: rgba(25, 135, 84, 0.1);
+    color: #20c997;
+    border-color: #198754;
+}
+
+/* Tracking target circle */
+.tracking-target {
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    border: 2px solid #ff0000;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+}
+
+/* Angle labels on radar */
+.angle-label {
+    color: #62ff00;
+    font-size: 12px;
+    position: absolute;
+}
+
+/* Distance circles on radar */
+.distance-circle {
+    stroke: #62ff00;
+    stroke-width: 1;
+    fill: none;
+}
+
+/* Scanning line */
+.radar-line {
+    stroke: #20c997;
+    stroke-width: 3;
+}
+
+/* Detected object dot */
+.detected-object {
+    fill: #ff0000;
+}
+
+/* For mobile responsiveness */
+@media (max-width: 768px) {
+    .container-fluid {
+        padding: 10px;
+    }
+    
+    header h2, header h3 {
+        font-size: 1.2rem;
+    }
+    
+    #status-info {
+        font-size: 0.9rem;
+    }
+}
+
+/* Animation for radar scanning */
+@keyframes scanning {
+    0% {
+        transform: rotate(0deg);
+    }
+    100% {
+        transform: rotate(180deg);
+    }
+} 
