@@ -18,10 +18,11 @@ import cv2
 import base64
 
 # Constants
-ARDUINO_COM_PORT = 'COM5'  # Change to your Arduino port
+ARDUINO_COM_PORT = 'COM8'  # Change to your Arduino port
 MIN_RADAR_ANGLE = 15       # Góc tối thiểu của servo radar
 MAX_RADAR_ANGLE = 165      # Góc tối đa của servo radar
 DETECTION_DISTANCE = 40    # Khoảng cách phát hiện đối tượng (cm) - khớp với Arduino
+ARDUINO_DELAY = 30         # Delay time (ms) của Arduino servo giữa các bước góc
 
 # Initialize FastAPI
 app = FastAPI(title="Web Radar Tracking System")
@@ -47,6 +48,12 @@ detected_distance = 0
 main_event_loop = None  # Store the main event loop
 last_serial_update_time = time.time()  # Thời điểm nhận được dữ liệu serial cuối cùng
 using_simulated_values = True  # Mặc định sử dụng giá trị mô phỏng cho radar
+last_received_angle = 90  # Góc cuối cùng nhận được từ Arduino
+consecutive_static_updates = 0  # Đếm số lần nhận được góc không thay đổi
+radar_moving = False  # Flag để xác định khi nào servo đang quay
+last_radar_data_time = 0  # Thời gian nhận được dữ liệu radar cuối cùng
+is_object_detected = False  # Add this flag to track object detection status
+waiting_for_first_radar_data = False  # Flag to indicate waiting for first radar data after mode switch
 
 # Thread safety
 serial_lock = threading.Lock()
@@ -347,7 +354,10 @@ def setup_serial():
 
 # Serial data processing
 async def read_serial():
-    global radar_angle, radar_distance, radar_direction, mode, detected_angle, detected_distance, system_message, camera_thread
+    global radar_angle, radar_distance, radar_direction, mode, detected_angle, detected_distance
+    global system_message, camera_thread, last_serial_update_time, last_received_angle
+    global consecutive_static_updates, radar_moving, last_radar_data_time, is_object_detected
+    global waiting_for_first_radar_data
     
     if serial_port is None or not serial_port.is_open:
         return
@@ -386,7 +396,7 @@ async def read_serial():
                             }))
                             
                             # Wait a moment to let the client display the detection
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.3)  # Giảm độ trễ
                             
                             # THEN switch to tracking mode
                             if mode != "TRACKING":
@@ -401,9 +411,11 @@ async def read_serial():
                         mode = "RADAR"
                         system_message = "System initialized, radar scanning active"
                         
-                        # Reset to default position (15 degrees) when starting
+                        # Reset for a fresh start
                         radar_angle = 15
+                        last_received_angle = 15
                         radar_direction = 1  # Start with increasing angle
+                        radar_moving = True  # Mặc định Arduino bắt đầu với việc quét radar
                             
                     elif '.' in radar_data:
                         # Arduino sends data in format "angle,distance."
@@ -419,19 +431,37 @@ async def read_serial():
                                         new_angle = int(parts[0])
                                         new_distance = int(parts[1])
                                         
-                                        # Determine radar direction based on angle change
-                                        if abs(new_angle - radar_angle) > 1:
-                                            if new_angle > radar_angle:
+                                        # Thời gian nhận dữ liệu radar
+                                        current_time = time.time()
+                                        last_radar_data_time = current_time
+                                        
+                                        # Kiểm tra nếu góc thay đổi, đánh dấu radar đang di chuyển
+                                        if abs(last_received_angle - new_angle) > 1:
+                                            radar_moving = True
+                                            consecutive_static_updates = 0  # Reset bộ đếm
+                                            print(f"Radar is moving. Angle changed from {last_received_angle} to {new_angle}")
+                                            
+                                            # Determine radar direction based on angle change
+                                            if new_angle > last_received_angle:
                                                 radar_direction = 1  # Increasing angles (e.g., 15 to 165)
                                             else:
                                                 radar_direction = -1  # Decreasing angles (e.g., 165 to 15)
+                                        else:
+                                            # Góc không thay đổi, tăng bộ đếm
+                                            consecutive_static_updates += 1
+                                            
+                                            # Nếu nhận được nhiều cập nhật liên tiếp với cùng một góc, có thể servo đang dừng
+                                            if consecutive_static_updates > 5:
+                                                radar_moving = False
+                                                print(f"Radar stopped. Angle stable at {new_angle}")
                                         
-                                        # Debug message for tracking - print BEFORE updating values
-                                        print(f"Updating radar from {radar_angle}° to {new_angle}°, Distance={new_distance}cm, Direction={radar_direction}")
+                                        # Lưu góc nhận được để so sánh lần sau
+                                        last_received_angle = new_angle
                                         
                                         # Always update radar values
                                         radar_angle = new_angle
                                         radar_distance = new_distance
+                                        last_serial_update_time = current_time
                                         
                                         # Enforce limits
                                         if radar_angle < MIN_RADAR_ANGLE:
@@ -449,8 +479,32 @@ async def read_serial():
                                             "distance": radar_distance,
                                             "mode": mode,
                                             "direction": radar_direction,
-                                            "detection": detection_highlight
+                                            "detection": detection_highlight,
+                                            "moving": radar_moving,
+                                            "timestamp": current_time
                                         }))
+                                        
+                                        if waiting_for_first_radar_data and mode == "RADAR":
+                                            waiting_for_first_radar_data = False
+                                            system_message = "✅ Radar data received from Arduino, resuming normal operation"
+                                            print("✅ First radar data received after mode switch - unfreezing radar")
+                                            
+                                            # Update detection_highlight correctly using is_object_detected
+                                            is_object_detected = detection_highlight
+                                            
+                                            # IMPORTANT: Always broadcast to ensure radar moves
+                                            await broadcast_message(json.dumps({
+                                                "type": "radar",
+                                                "angle": radar_angle,
+                                                "distance": radar_distance,
+                                                "mode": mode,
+                                                "direction": radar_direction,
+                                                "detection": detection_highlight,
+                                                "moving": radar_moving,
+                                                "timestamp": current_time,
+                                                "first_data_after_switch": True,
+                                                "resume_animation": True  # Tell frontend to resume animation
+                                            }))
                                         
                                     except ValueError:
                                         print(f"Error parsing values: '{parts}'")
@@ -483,21 +537,43 @@ async def switch_to_tracking_mode():
     }))
 
 async def switch_to_radar_mode():
-    global mode, system_message, camera_thread
+    global mode, system_message, camera_thread, radar_moving, last_radar_data_time, radar_distance
+    global detected_distance, detected_angle, is_object_detected, radar_direction
+    global waiting_for_first_radar_data, using_simulated_values
     
     mode = "RADAR"
-    system_message = "Returning to radar scanning mode"
+    system_message = "Returning to radar scanning mode - WAITING for radar data from Arduino"
     print(system_message)
     
     # Pause camera
     if camera_thread and not camera_thread.is_paused():
         camera_thread.pause()
     
-    # Notify clients
+    # COMPLETELY reset all radar state to ensure no movement
+    radar_moving = False
+    radar_distance = 200  # Very safe value - no detection visualization
+    detected_distance = 0
+    detected_angle = 0
+    last_radar_data_time = 0
+    is_object_detected = False  # Explicitly reset object detection status
+    waiting_for_first_radar_data = True  # Set flag to indicate waiting for data
+    using_simulated_values = False  # Ensure we're not using simulated values
+    
+    # Force a complete wait for real Arduino data
+    print("🛑 RADAR FROZEN - Waiting for fresh Arduino data before resuming")
+    
+    # Notify clients with current position (HARD FROZEN until we get Arduino data)
     await broadcast_message(json.dumps({
         "type": "mode_change",
         "mode": "RADAR",
-        "message": system_message
+        "message": system_message,
+        "moving": False,  # Explicitly tell clients the radar is not moving
+        "angle": radar_angle,  # Send current angle to ensure frontend uses this as the fixed position
+        "distance": radar_distance,  # Send safe distance to avoid triggering detection
+        "waiting_for_data": True,  # Explicitly indicate we're waiting for data
+        "hard_freeze": True,  # Force a complete freeze of radar display
+        "detection": False,  # Explicitly set detection to false
+        "stop_animation": True  # Tell frontend to completely stop animation
     }))
 
 # Broadcast to all WebSocket clients
@@ -530,7 +606,9 @@ async def websocket_endpoint(websocket: WebSocket):
             "distance": radar_distance,
             "message": system_message,
             "missing_libraries": MISSING_LIBRARIES,
-            "direction": radar_direction  # Ensure direction is sent
+            "direction": radar_direction,  # Ensure direction is sent
+            "moving": radar_moving,  # Send radar moving state
+            "timestamp": time.time()
         })
         
         # Immediately send a radar update to ensure the client has the latest position
@@ -541,51 +619,77 @@ async def websocket_endpoint(websocket: WebSocket):
                 "distance": radar_distance,
                 "mode": mode,
                 "direction": radar_direction,
-                "detection": radar_distance < DETECTION_DISTANCE
+                "detection": radar_distance < DETECTION_DISTANCE,
+                "moving": radar_moving,  # Include current moving state
+                "timestamp": time.time()
             })
-            
-        # Wait for messages from client
+        
+        # Main client message loop
         while True:
-            data = await websocket.receive_text()
+            message = await websocket.receive_text()
             try:
-                message = json.loads(data)
-                command = message.get("command")
+                data = json.loads(message)
+                command = data.get("command")
                 
                 if command == "switch_mode":
-                    new_mode = message.get("mode")
-                    if new_mode == "RADAR" and mode != "RADAR":
+                    requested_mode = data.get("mode")
+                    if requested_mode == "RADAR" and mode != "RADAR":
                         await switch_to_radar_mode()
-                    elif new_mode == "TRACKING" and mode != "TRACKING":
+                    elif requested_mode == "TRACKING" and mode != "TRACKING":
                         await switch_to_tracking_mode()
                 
                 elif command == "tracking_type":
-                    global tracking_mode
-                    new_type = message.get("type")
-                    if new_type in [1, 2]:
-                        tracking_mode = new_type
+                    tracking_type = data.get("type")
+                    if tracking_type in [1, 2]:
+                        global tracking_mode
+                        tracking_mode = tracking_type
+                        # Initialize appropriate detector
                         if camera_thread:
                             camera_thread.initialize_detectors()
                         
-                        await websocket.send_json({
+                        await broadcast_message(json.dumps({
                             "type": "system_message",
-                            "message": f"Switched to {'face' if tracking_mode == 1 else 'hand'} tracking"
-                        })
+                            "message": f"Changed tracking mode to {('Face' if tracking_mode == 1 else 'Hand')} tracking"
+                        }))
+                        
+                elif command == "get_radar_status":
+                    # Client is requesting current radar status - useful after page refresh or reconnection
+                    await websocket.send_json({
+                        "type": "radar",
+                        "angle": radar_angle,
+                        "distance": radar_distance,
+                        "mode": mode,
+                        "direction": radar_direction,
+                        "detection": radar_distance < DETECTION_DISTANCE,
+                        "moving": radar_moving,
+                        "timestamp": time.time()
+                    })
+                
+                elif command == "shoot":
+                    # Xử lý lệnh bắn
+                    success = await send_shoot_command()
+                    await websocket.send_json({
+                        "type": "shoot_response",
+                        "success": success,
+                        "message": system_message
+                    })
+                
             except json.JSONDecodeError:
-                print(f"Invalid JSON received: {data}")
+                print(f"Invalid JSON received: {message}")
             except Exception as e:
-                print(f"Error processing message: {e}")
+                print(f"Error processing client message: {e}")
                 traceback.print_exc()
-            
-            # Process serial data after each message
-            await read_serial()
     
     except WebSocketDisconnect:
-        pass
+        # Remove from connected clients
+        connected_clients.remove(websocket)
+        print("Client disconnected from WebSocket")
     except Exception as e:
+        # Handle other exceptions
         print(f"WebSocket error: {e}")
         traceback.print_exc()
-    finally:
-        # Remove from connected clients
+        
+        # Try to remove client if still in list
         if websocket in connected_clients:
             connected_clients.remove(websocket)
 
@@ -626,11 +730,14 @@ async def startup_event():
 
 # Background task to read serial data
 async def serial_reader_task():
-    global radar_angle, radar_direction, radar_distance
+    global radar_angle, radar_direction, radar_distance, radar_moving, last_radar_data_time
+    global is_object_detected, waiting_for_first_radar_data
     
     # Đặt góc bắt đầu giống Arduino (15 độ)
     radar_angle = MIN_RADAR_ANGLE
     radar_direction = 1  # Bắt đầu với hướng tăng
+    radar_moving = False  # Start with radar not moving until we get data
+    is_object_detected = False
     
     print(f"Starting serial reader task with initial angle: {radar_angle}")
     
@@ -638,8 +745,20 @@ async def serial_reader_task():
         # Đọc dữ liệu từ cổng serial nếu có
         await read_serial()
         
-        # Không tự động cập nhật góc quét - chỉ khi có dữ liệu từ Arduino
-        # Nếu không có dữ liệu từ Arduino, góc quét vẫn giữ nguyên
+        # If we haven't received radar data in a while, explicitly mark it as not moving
+        if time.time() - last_radar_data_time > 1.0 and radar_moving:
+            radar_moving = False
+            # Notify clients that radar has stopped moving
+            await broadcast_message(json.dumps({
+                "type": "radar",
+                "angle": radar_angle,
+                "distance": radar_distance,
+                "mode": mode,
+                "direction": radar_direction,
+                "detection": is_object_detected,  # Use the correct variable
+                "moving": False,
+                "timestamp": time.time()
+            }))
         
         # Đợi một khoảng thời gian ngắn để không quá tải CPU
         await asyncio.sleep(0.01)
@@ -664,6 +783,35 @@ async def shutdown_event():
         print("Serial port closed")
     
     print("System shutdown complete")
+
+# Hàm gửi lệnh bắn cho Arduino
+async def send_shoot_command():
+    global serial_port, system_message
+    
+    try:
+        with serial_lock:
+            if serial_port and serial_port.is_open:
+                # Gửi lệnh SHOOT
+                serial_port.write(b"SHOOT\r")
+                system_message = "Shoot command sent to Arduino"
+                print(system_message)
+                
+                # Thông báo cho tất cả client
+                await broadcast_message(json.dumps({
+                    "type": "system_message",
+                    "message": "🔫 SHOOT! Taking aim at detected object..."
+                }))
+                
+                return True
+            else:
+                system_message = "Cannot send shoot command - Serial port not connected"
+                print(system_message)
+                return False
+    except Exception as e:
+        system_message = f"Error sending shoot command: {str(e)}"
+        print(system_message)
+        traceback.print_exc()
+        return False
 
 # Run app
 if __name__ == "__main__":
