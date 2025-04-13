@@ -18,11 +18,11 @@ import cv2
 import base64
 
 # Constants
-ARDUINO_COM_PORT = 'COM8'  # Change to your Arduino port
+ARDUINO_COM_PORT = 'COM6'  # Change to your ESP32 port
 MIN_RADAR_ANGLE = 15       # Góc tối thiểu của servo radar
 MAX_RADAR_ANGLE = 165      # Góc tối đa của servo radar
-DETECTION_DISTANCE = 40    # Khoảng cách phát hiện đối tượng (cm) - khớp với Arduino
-ARDUINO_DELAY = 30         # Delay time (ms) của Arduino servo giữa các bước góc
+DETECTION_DISTANCE = 40    # Khoảng cách phát hiện đối tượng (cm) - khớp với ESP32
+ARDUINO_DELAY = 30         # Delay time (ms) của ESP32 servo giữa các bước góc
 
 # Initialize FastAPI
 app = FastAPI(title="Web Radar Tracking System")
@@ -48,7 +48,7 @@ detected_distance = 0
 main_event_loop = None  # Store the main event loop
 last_serial_update_time = time.time()  # Thời điểm nhận được dữ liệu serial cuối cùng
 using_simulated_values = True  # Mặc định sử dụng giá trị mô phỏng cho radar
-last_received_angle = 90  # Góc cuối cùng nhận được từ Arduino
+last_received_angle = 90  # Góc cuối cùng nhận được từ ESP32
 consecutive_static_updates = 0  # Đếm số lần nhận được góc không thay đổi
 radar_moving = False  # Flag để xác định khi nào servo đang quay
 last_radar_data_time = 0  # Thời gian nhận được dữ liệu radar cuối cùng
@@ -261,8 +261,8 @@ class CameraThread(threading.Thread):
                         self.last_position = (nose_x, nose_y)
                         tracking_position = (nose_x, nose_y)
                         
-                        # Send to Arduino
-                        self.send_coordinates_to_arduino(nose_x, nose_y, frame_width, frame_height)
+                        # Send to ESP32
+                        self.send_coordinates_to_esp32(nose_x, nose_y, frame_width, frame_height)
                         
             elif tracking_mode == 2 and hand_detector:
                 # Hand detection
@@ -280,14 +280,14 @@ class CameraThread(threading.Thread):
                         self.last_position = (wrist_x, wrist_y)
                         tracking_position = (wrist_x, wrist_y)
                         
-                        # Send to Arduino
-                        self.send_coordinates_to_arduino(wrist_x, wrist_y, frame_width, frame_height)
+                        # Send to ESP32
+                        self.send_coordinates_to_esp32(wrist_x, wrist_y, frame_width, frame_height)
         
         except Exception as e:
             print(f"Error in frame processing: {e}")
             traceback.print_exc()
     
-    def send_coordinates_to_arduino(self, x, y, frame_width, frame_height):
+    def send_coordinates_to_esp32(self, x, y, frame_width, frame_height):
         global serial_port, system_message
         
         try:
@@ -296,10 +296,10 @@ class CameraThread(threading.Thread):
                 if serial_port is not None and serial_port.is_open:
                     coordinates = f"{int(x)},{int(y)}\r"
                     serial_port.write(coordinates.encode())
-                    print(f"Sent to Arduino: X={int(x)}, Y={int(y)}")
+                    print(f"Sent to ESP32: X={int(x)}, Y={int(y)}")
                     system_message = f"Tracking: X={int(x)}, Y={int(y)}"
         except Exception as e:
-            print(f"Error sending coordinates: {e}")
+            print(f"Error sending coordinates to ESP32: {e}")
             system_message = f"Tracking error: {str(e)}"
     
     def pause(self):
@@ -338,9 +338,9 @@ def setup_serial():
     global serial_port, system_message
     
     try:
-        serial_port = serial.Serial(ARDUINO_COM_PORT, 9600)
+        serial_port = serial.Serial(ARDUINO_COM_PORT, 115200)  # Updated baud rate for ESP32
         serial_port.timeout = 0.1
-        system_message = f"Connected to Arduino on {ARDUINO_COM_PORT}"
+        system_message = f"Connected to ESP32 CAM on {ARDUINO_COM_PORT}"
         print(system_message)
         return True
     except serial.SerialException as e:
@@ -375,7 +375,7 @@ async def read_serial():
                     except UnicodeDecodeError:
                         radar_data = raw_data.decode('latin-1').strip()
                     
-                    print(f"Received from Arduino: {radar_data}")  # Debug: print received data
+                    print(f"Received from ESP32: {radar_data}")  # Debug: print received data
                     
                     # Check for events or radar data
                     if "Object detected at angle" in radar_data:
@@ -415,10 +415,10 @@ async def read_serial():
                         radar_angle = 15
                         last_received_angle = 15
                         radar_direction = 1  # Start with increasing angle
-                        radar_moving = True  # Mặc định Arduino bắt đầu với việc quét radar
+                        radar_moving = True  # Mặc định ESP32 bắt đầu với việc quét radar
                             
                     elif '.' in radar_data:
-                        # Arduino sends data in format "angle,distance."
+                        # ESP32 sends data in format "angle,distance."
                         # Ensure we parse it correctly
                         try:
                             # Get portion before the dot
@@ -486,7 +486,7 @@ async def read_serial():
                                         
                                         if waiting_for_first_radar_data and mode == "RADAR":
                                             waiting_for_first_radar_data = False
-                                            system_message = "✅ Radar data received from Arduino, resuming normal operation"
+                                            system_message = "✅ Radar data received from ESP32, resuming normal operation"
                                             print("✅ First radar data received after mode switch - unfreezing radar")
                                             
                                             # Update detection_highlight correctly using is_object_detected
@@ -542,7 +542,7 @@ async def switch_to_radar_mode():
     global waiting_for_first_radar_data, using_simulated_values
     
     mode = "RADAR"
-    system_message = "Returning to radar scanning mode - WAITING for radar data from Arduino"
+    system_message = "Returning to radar scanning mode - WAITING for radar data from ESP32"
     print(system_message)
     
     # Pause camera
@@ -559,10 +559,10 @@ async def switch_to_radar_mode():
     waiting_for_first_radar_data = True  # Set flag to indicate waiting for data
     using_simulated_values = False  # Ensure we're not using simulated values
     
-    # Force a complete wait for real Arduino data
-    print("🛑 RADAR FROZEN - Waiting for fresh Arduino data before resuming")
+    # Force a complete wait for real ESP32 data
+    print("🛑 RADAR FROZEN - Waiting for fresh ESP32 data before resuming")
     
-    # Notify clients with current position (HARD FROZEN until we get Arduino data)
+    # Notify clients with current position (HARD FROZEN until we get ESP32 data)
     await broadcast_message(json.dumps({
         "type": "mode_change",
         "mode": "RADAR",
@@ -733,7 +733,7 @@ async def serial_reader_task():
     global radar_angle, radar_direction, radar_distance, radar_moving, last_radar_data_time
     global is_object_detected, waiting_for_first_radar_data
     
-    # Đặt góc bắt đầu giống Arduino (15 độ)
+    # Đặt góc bắt đầu giống ESP32 (15 độ)
     radar_angle = MIN_RADAR_ANGLE
     radar_direction = 1  # Bắt đầu với hướng tăng
     radar_moving = False  # Start with radar not moving until we get data
@@ -784,7 +784,7 @@ async def shutdown_event():
     
     print("System shutdown complete")
 
-# Hàm gửi lệnh bắn cho Arduino
+# Hàm gửi lệnh bắn cho ESP32
 async def send_shoot_command():
     global serial_port, system_message
     
@@ -793,7 +793,7 @@ async def send_shoot_command():
             if serial_port and serial_port.is_open:
                 # Gửi lệnh SHOOT
                 serial_port.write(b"SHOOT\r")
-                system_message = "Shoot command sent to Arduino"
+                system_message = "Shoot command sent to ESP32"
                 print(system_message)
                 
                 # Thông báo cho tất cả client

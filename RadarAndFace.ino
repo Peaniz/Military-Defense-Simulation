@@ -1,11 +1,25 @@
-#include <Servo.h>
+/*
+ * ESP32 CAM Radar and Face Tracking System
+ * 
+ * Required Libraries:
+ * - ESP32Servo (Install via Arduino Library Manager)
+ * 
+ * Pin Connections:
+ * - Trigger Pin: IO2
+ * - Echo Pin: IO14
+ * - Up/Down Servo: IO15
+ * - Radar Servo: IO12
+ * - Left/Right Servo: IO13
+ */
 
-// Pin definitions
-const int radarServoPin = 11;
-const int trigPin = 9;
-const int echoPin = 10;
-const int left_rightPin = 13;
-const int up_downPin = 12;
+#include <ESP32Servo.h>
+
+// Pin definitions for ESP32 CAM
+const int radarServoPin = 12; // Changed from 11 to IO12
+const int trigPin = 2;        // Changed from 9 to IO2
+const int echoPin = 14;       // Changed from 10 to IO14
+const int left_rightPin = 13; // Remains IO13
+const int up_downPin = 15;    // Changed from 12 to IO15
 
 // Variables
 long duration;
@@ -44,20 +58,29 @@ Servo left_right;
 Servo up_down;
 
 void setup() {
-  // Setup servo motors
-  radarServo.attach(radarServoPin);
-  left_right.attach(left_rightPin);
-  up_down.attach(up_downPin);
+  // Setup servo motors with ESP32 specific settings
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
+  radarServo.setPeriodHertz(50);  // Standard 50Hz servo
+  left_right.setPeriodHertz(50);  // Standard 50Hz servo
+  up_down.setPeriodHertz(50);     // Standard 50Hz servo
+  
+  radarServo.attach(radarServoPin, 500, 2400);
+  left_right.attach(left_rightPin, 500, 2400);
+  up_down.attach(up_downPin, 500, 2400);
   
   // Setup ultrasonic sensor
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
   
   // Initialize serial communication
-  Serial.begin(9600);
+  Serial.begin(115200); // Increased baud rate for ESP32
   
   // Initial message
-  Serial.println("System initialized, starting radar scan mode");
+  Serial.println("ESP32 CAM System initialized, starting radar scan mode");
   
   // Set initial position for radar servo
   radarServo.write(MIN_RADAR_ANGLE);
