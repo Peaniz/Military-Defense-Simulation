@@ -18,11 +18,12 @@ import cv2
 import base64
 
 # Constants
-ARDUINO_COM_PORT = 'COM6'  # Change to your ESP32 port
+ARDUINO_COM_PORT = 'COM6'  # Keep for optional fallback to Serial
 MIN_RADAR_ANGLE = 15       # Góc tối thiểu của servo radar
 MAX_RADAR_ANGLE = 165      # Góc tối đa của servo radar
 DETECTION_DISTANCE = 40    # Khoảng cách phát hiện đối tượng (cm) - khớp với ESP32
 ARDUINO_DELAY = 30         # Delay time (ms) của ESP32 servo giữa các bước góc
+USE_WEBSOCKET = True       # Set to True to use WebSocket instead of Serial
 
 # Initialize FastAPI
 app = FastAPI(title="Web Radar Tracking System")
@@ -46,7 +47,7 @@ tracking_mode = 1  # 1 = Face, 2 = Hand
 detected_angle = 0
 detected_distance = 0
 main_event_loop = None  # Store the main event loop
-last_serial_update_time = time.time()  # Thời điểm nhận được dữ liệu serial cuối cùng
+last_serial_update_time = time.time()  # Thời điểm nhận được dữ liệu cuối cùng
 using_simulated_values = True  # Mặc định sử dụng giá trị mô phỏng cho radar
 last_received_angle = 90  # Góc cuối cùng nhận được từ ESP32
 consecutive_static_updates = 0  # Đếm số lần nhận được góc không thay đổi
@@ -54,6 +55,9 @@ radar_moving = False  # Flag để xác định khi nào servo đang quay
 last_radar_data_time = 0  # Thời gian nhận được dữ liệu radar cuối cùng
 is_object_detected = False  # Add this flag to track object detection status
 waiting_for_first_radar_data = False  # Flag to indicate waiting for first radar data after mode switch
+
+# ESP32 WebSocket client
+esp32_client = None
 
 # Thread safety
 serial_lock = threading.Lock()
@@ -288,16 +292,32 @@ class CameraThread(threading.Thread):
             traceback.print_exc()
     
     def send_coordinates_to_esp32(self, x, y, frame_width, frame_height):
-        global serial_port, system_message
+        global serial_port, system_message, esp32_client
         
         try:
-            # Get lock to prevent simultaneous access
-            with serial_lock:
-                if serial_port is not None and serial_port.is_open:
+            if USE_WEBSOCKET and esp32_client is not None:
+                # Send coordinates via WebSocket
+                message = {
+                    "command": "TRACK",
+                    "x": int(x),
+                    "y": int(y)
+                }
+                asyncio.run_coroutine_threadsafe(
+                    esp32_client.send_text(json.dumps(message)), 
+                    main_event_loop
+                )
+                system_message = f"Tracking via WebSocket: X={int(x)}, Y={int(y)}"
+                print(system_message)
+            # Fallback to Serial if WebSocket not available
+            elif not USE_WEBSOCKET and serial_port is not None and serial_port.is_open:
+                # Get lock to prevent simultaneous access
+                with serial_lock:
                     coordinates = f"{int(x)},{int(y)}\r"
                     serial_port.write(coordinates.encode())
-                    print(f"Sent to ESP32: X={int(x)}, Y={int(y)}")
+                    print(f"Sent to ESP32 via Serial: X={int(x)}, Y={int(y)}")
                     system_message = f"Tracking: X={int(x)}, Y={int(y)}"
+            else:
+                system_message = "No connection to ESP32 available"
         except Exception as e:
             print(f"Error sending coordinates to ESP32: {e}")
             system_message = f"Tracking error: {str(e)}"
@@ -333,12 +353,17 @@ class CameraThread(threading.Thread):
 # Initialize camera thread
 camera_thread = None
 
-# Setup serial connection
+# Setup serial connection (now optional)
 def setup_serial():
     global serial_port, system_message
     
+    if USE_WEBSOCKET:
+        system_message = "Using WebSocket connection instead of Serial"
+        print(system_message)
+        return False
+    
     try:
-        serial_port = serial.Serial(ARDUINO_COM_PORT, 115200)  # Updated baud rate for ESP32
+        serial_port = serial.Serial(ARDUINO_COM_PORT, 115200)
         serial_port.timeout = 0.1
         system_message = f"Connected to ESP32 CAM on {ARDUINO_COM_PORT}"
         print(system_message)
@@ -352,14 +377,15 @@ def setup_serial():
         print(system_message)
         return False
 
-# Serial data processing
+# Serial data processing - now handles both Serial and WebSocket data
 async def read_serial():
     global radar_angle, radar_distance, radar_direction, mode, detected_angle, detected_distance
     global system_message, camera_thread, last_serial_update_time, last_received_angle
     global consecutive_static_updates, radar_moving, last_radar_data_time, is_object_detected
     global waiting_for_first_radar_data
     
-    if serial_port is None or not serial_port.is_open:
+    # Only read from Serial if not using WebSocket
+    if USE_WEBSOCKET or serial_port is None or not serial_port.is_open:
         return
     
     try:
@@ -728,7 +754,7 @@ async def startup_event():
     # Start serial reading task
     asyncio.create_task(serial_reader_task())
 
-# Background task to read serial data
+# Background task to read serial data - modified to handle WebSocket
 async def serial_reader_task():
     global radar_angle, radar_direction, radar_distance, radar_moving, last_radar_data_time
     global is_object_detected, waiting_for_first_radar_data
@@ -739,13 +765,14 @@ async def serial_reader_task():
     radar_moving = False  # Start with radar not moving until we get data
     is_object_detected = False
     
-    print(f"Starting serial reader task with initial angle: {radar_angle}")
+    print(f"Starting data reader task with initial angle: {radar_angle}")
     
     while True:
-        # Đọc dữ liệu từ cổng serial nếu có
-        await read_serial()
+        # Read from Serial only if not using WebSocket
+        if not USE_WEBSOCKET:
+            await read_serial()
         
-        # If we haven't received radar data in a while, explicitly mark it as not moving
+        # Common code for both connection methods
         if time.time() - last_radar_data_time > 1.0 and radar_moving:
             radar_moving = False
             # Notify clients that radar has stopped moving
@@ -760,7 +787,7 @@ async def serial_reader_task():
                 "timestamp": time.time()
             }))
         
-        # Đợi một khoảng thời gian ngắn để không quá tải CPU
+        # Sleep to avoid CPU overload
         await asyncio.sleep(0.01)
 
 # Shutdown event
@@ -784,34 +811,209 @@ async def shutdown_event():
     
     print("System shutdown complete")
 
-# Hàm gửi lệnh bắn cho ESP32
+# Send shoot command to ESP32
 async def send_shoot_command():
-    global serial_port, system_message
+    global serial_port, system_message, esp32_client
     
     try:
-        with serial_lock:
-            if serial_port and serial_port.is_open:
-                # Gửi lệnh SHOOT
+        if USE_WEBSOCKET and esp32_client is not None:
+            # Send via WebSocket
+            message = {
+                "command": "SHOOT"
+            }
+            await esp32_client.send_text(json.dumps(message))
+            system_message = "Shoot command sent to ESP32 via WebSocket"
+            print(system_message)
+            
+            # Notify clients
+            await broadcast_message(json.dumps({
+                "type": "system_message",
+                "message": "🔫 SHOOT! Taking aim at detected object..."
+            }))
+            
+            return True
+        elif not USE_WEBSOCKET and serial_port and serial_port.is_open:
+            with serial_lock:
+                # Send via Serial
                 serial_port.write(b"SHOOT\r")
-                system_message = "Shoot command sent to ESP32"
+                system_message = "Shoot command sent to ESP32 via Serial"
                 print(system_message)
                 
-                # Thông báo cho tất cả client
+                # Notify clients
                 await broadcast_message(json.dumps({
                     "type": "system_message",
                     "message": "🔫 SHOOT! Taking aim at detected object..."
                 }))
                 
                 return True
-            else:
-                system_message = "Cannot send shoot command - Serial port not connected"
-                print(system_message)
-                return False
+        else:
+            system_message = "Cannot send shoot command - No connection to ESP32"
+            print(system_message)
+            return False
     except Exception as e:
         system_message = f"Error sending shoot command: {str(e)}"
         print(system_message)
         traceback.print_exc()
         return False
+
+# New WebSocket endpoint for ESP32 device
+@app.websocket("/ws/esp32")
+async def esp32_websocket_endpoint(websocket: WebSocket):
+    global esp32_client, system_message, radar_angle, radar_distance, radar_direction
+    global mode, detected_angle, detected_distance, last_serial_update_time
+    global consecutive_static_updates, radar_moving, last_radar_data_time, is_object_detected
+    global waiting_for_first_radar_data, last_received_angle
+    
+    await websocket.accept()
+    
+    # Set as the ESP32 client
+    esp32_client = websocket
+    system_message = "ESP32 connected via WebSocket"
+    print(system_message)
+    
+    try:
+        while True:
+            # Receive messages from ESP32
+            data = await websocket.receive_text()
+            
+            try:
+                # Parse the JSON data
+                json_data = json.loads(data)
+                message_type = json_data.get("type", "")
+                
+                # Process based on message type
+                if message_type == "radar":
+                    # Update radar data
+                    new_angle = json_data.get("angle", radar_angle)
+                    new_distance = json_data.get("distance", radar_distance)
+                    new_direction = json_data.get("direction", radar_direction)
+                    
+                    # Record time of data receipt
+                    current_time = time.time()
+                    last_radar_data_time = current_time
+                    
+                    # Check for angle change
+                    if abs(last_received_angle - new_angle) > 1:
+                        radar_moving = True
+                        consecutive_static_updates = 0
+                        print(f"Radar is moving. Angle changed from {last_received_angle} to {new_angle}")
+                        
+                        # Determine direction
+                        radar_direction = new_direction
+                    else:
+                        # Angle not changing
+                        consecutive_static_updates += 1
+                        
+                        if consecutive_static_updates > 5:
+                            radar_moving = False
+                            print(f"Radar stopped. Angle stable at {new_angle}")
+                    
+                    # Update values
+                    last_received_angle = new_angle
+                    radar_angle = new_angle
+                    radar_distance = new_distance
+                    last_serial_update_time = current_time
+                    
+                    # Apply limits
+                    if radar_angle < MIN_RADAR_ANGLE:
+                        radar_angle = MIN_RADAR_ANGLE
+                    elif radar_angle > MAX_RADAR_ANGLE:
+                        radar_angle = MAX_RADAR_ANGLE
+                    
+                    # Check for object detection
+                    detection_highlight = radar_distance < DETECTION_DISTANCE
+                    
+                    # Broadcast to clients
+                    await broadcast_message(json.dumps({
+                        "type": "radar",
+                        "angle": radar_angle,
+                        "distance": radar_distance,
+                        "mode": mode,
+                        "direction": radar_direction,
+                        "detection": detection_highlight,
+                        "moving": radar_moving,
+                        "timestamp": current_time
+                    }))
+                    
+                    if waiting_for_first_radar_data and mode == "RADAR":
+                        waiting_for_first_radar_data = False
+                        system_message = "✅ Radar data received from ESP32, resuming normal operation"
+                        print("✅ First radar data received after mode switch - unfreezing radar")
+                        
+                        is_object_detected = detection_highlight
+                        
+                        await broadcast_message(json.dumps({
+                            "type": "radar",
+                            "angle": radar_angle,
+                            "distance": radar_distance,
+                            "mode": mode,
+                            "direction": radar_direction,
+                            "detection": detection_highlight,
+                            "moving": radar_moving,
+                            "timestamp": current_time,
+                            "first_data_after_switch": True,
+                            "resume_animation": True
+                        }))
+                
+                elif message_type == "object_detected":
+                    # Object detected by ESP32
+                    detected_angle = json_data.get("angle", 90)
+                    detected_distance = json_data.get("distance", 0)
+                    
+                    # Notify clients
+                    await broadcast_message(json.dumps({
+                        "type": "object_detected",
+                        "angle": detected_angle,
+                        "distance": detected_distance
+                    }))
+                    
+                    # Wait briefly then switch to tracking
+                    await asyncio.sleep(0.3)
+                    
+                    if mode != "TRACKING":
+                        await switch_to_tracking_mode()
+                
+                elif message_type == "message":
+                    # System message from ESP32
+                    content = json_data.get("content", "")
+                    print(f"ESP32 message: {content}")
+                    
+                    # Check for specific messages
+                    if "Timeout: Returning to radar mode" in content:
+                        if mode != "RADAR":
+                            await switch_to_radar_mode()
+                    elif "System initialized" in content:
+                        mode = "RADAR"
+                        system_message = "System initialized, radar scanning active"
+                        
+                        # Reset for a fresh start
+                        radar_angle = 15
+                        last_received_angle = 15
+                        radar_direction = 1
+                        radar_moving = True
+                
+                elif message_type == "tracking":
+                    # Tracking feedback from ESP32
+                    x = json_data.get("x", 0)
+                    y = json_data.get("y", 0)
+                    system_message = f"Tracking position: X={x}, Y={y}"
+                
+            except json.JSONDecodeError:
+                print(f"Invalid JSON from ESP32: {data}")
+            except Exception as e:
+                print(f"Error processing ESP32 data: {e}")
+                traceback.print_exc()
+    
+    except WebSocketDisconnect:
+        # Handle disconnect
+        esp32_client = None
+        system_message = "ESP32 WebSocket disconnected"
+        print(system_message)
+    except Exception as e:
+        # Handle other errors
+        esp32_client = None
+        print(f"ESP32 WebSocket error: {e}")
+        traceback.print_exc()
 
 # Run app
 if __name__ == "__main__":

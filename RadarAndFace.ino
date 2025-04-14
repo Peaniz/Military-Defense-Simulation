@@ -3,6 +3,8 @@
  * 
  * Required Libraries:
  * - ESP32Servo (Install via Arduino Library Manager)
+ * - WiFi.h (Built-in with ESP32)
+ * - WebSocketsClient.h (Install via Arduino Library Manager)
  * 
  * Pin Connections:
  * - Trigger Pin: IO2
@@ -13,6 +15,18 @@
  */
 
 #include <ESP32Servo.h>
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+
+// WiFi credentials
+const char* ssid = "Thu Nam";     // Replace with your WiFi SSID
+const char* password = "thunam12345"; // Replace with your WiFi password
+
+// WebSocket server settings
+const char* wsHost = "192.168.1.100";    // Replace with your server IP address
+const uint16_t wsPort = 8000;            // Server port
+const char* wsPath = "/ws/esp32";        // WebSocket path
 
 // Pin definitions for ESP32 CAM
 const int radarServoPin = 12; // Changed from 11 to IO12
@@ -57,6 +71,10 @@ Servo radarServo;
 Servo left_right;
 Servo up_down;
 
+// WebSocket client
+WebSocketsClient webSocket;
+bool websocketConnected = false;
+
 void setup() {
   // Setup servo motors with ESP32 specific settings
   ESP32PWM::allocateTimer(0);
@@ -76,24 +94,50 @@ void setup() {
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
   
-  // Initialize serial communication
-  Serial.begin(115200); // Increased baud rate for ESP32
+  // Initialize serial communication (keep for debugging)
+  Serial.begin(115200);
   
   // Initial message
-  Serial.println("ESP32 CAM System initialized, starting radar scan mode");
+  Serial.println("ESP32 CAM System initializing");
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Configure and connect WebSocket client
+  setupWebSocket();
   
   // Set initial position for radar servo
   radarServo.write(MIN_RADAR_ANGLE);
   currentRadarAngle = MIN_RADAR_ANGLE;
   radarSweepDirection = 1;
   delay(500); // Give time for the servo to move
+  
+  // Notify server that system is initialized
+  if (websocketConnected) {
+    sendMessage("ESP32 CAM System initialized, starting radar scan mode");
+  }
 }
 
 void loop() {
+  // Keep WebSocket connection alive
+  webSocket.loop();
+  
+  // Check WebSocket connection status
+  if (!websocketConnected) {
+    // Try to reconnect if connection is lost
+    static unsigned long lastReconnectAttempt = 0;
+    unsigned long now = millis();
+    if (now - lastReconnectAttempt > 5000) {
+      lastReconnectAttempt = now;
+      Serial.println("Attempting to reconnect WebSocket...");
+      setupWebSocket();
+    }
+  }
+  
   currentMillis = millis(); // Get current time
 
-  // Kiểm tra lệnh từ Serial (ưu tiên)
-  checkSerialCommands();
+  // Check for WebSocket commands
+  checkWebSocketCommands();
 
   if (isShootMode) {
     // Nếu đang ở chế độ bắn
@@ -102,10 +146,10 @@ void loop() {
       isShootMode = false;
       if (objectDetected) {
         // Quay lại chế độ tracking
-        Serial.println("Shoot completed, returning to tracking mode");
+        sendMessage("Shoot completed, returning to tracking mode");
       } else {
         // Quay lại chế độ radar
-        Serial.println("Shoot completed, returning to radar scan mode");
+        sendMessage("Shoot completed, returning to radar scan mode");
       }
     } else {
       // Đang trong chế độ bắn, không làm gì cả ngoài đợi
@@ -119,7 +163,9 @@ void loop() {
     if (currentMillis - lastCommandTime > COMMAND_TIMEOUT) {
       objectDetected = false;
       detectionCounter = 0;
-      Serial.println("Timeout: Returning to radar mode");
+      
+      // Send message through WebSocket instead of Serial
+      sendMessage("Timeout: Returning to radar mode");
       
       // KHÔNG reset servo về vị trí ban đầu, giữ nguyên vị trí hiện tại
       // Chỉ cập nhật hướng quét để bắt đầu quét hợp lý
@@ -135,38 +181,126 @@ void loop() {
   }
 }
 
-// Kiểm tra các lệnh đặc biệt từ Serial
-void checkSerialCommands() {
-  if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\r');
-    
-    if (command == "SHOOT") {
-      // Kích hoạt chế độ bắn
-      isShootMode = true;
-      shootModeStartTime = currentMillis;
-      Serial.println("SHOOT command activated");
-    }
-    else if (command.startsWith("SET_ANGLE:")) {
-      // Lệnh SET_ANGLE:90 sẽ đặt góc servo thành 90 độ
-      int angle = command.substring(10).toInt();
-      if (angle >= MIN_RADAR_ANGLE && angle <= MAX_RADAR_ANGLE) {
-        radarServo.write(angle);
-        currentRadarAngle = angle;
-        Serial.print("Radar angle set to: ");
-        Serial.println(angle);
-      }
-    }
-    else if (objectDetected && command.indexOf(',') > 0) {
-      // Đây là tọa độ tracking
-      inputString = command;
-      lastCommandTime = currentMillis; // Update last command time
-      
-      // Xử lý trong faceTrackingMode()
-      faceTrackingMode();
-    }
+// Connect to WiFi network
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  // Wait for connection
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.print("Connected to WiFi. IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("");
+    Serial.println("Failed to connect to WiFi. Operating in offline mode.");
   }
 }
 
+// Setup WebSocket connection
+void setupWebSocket() {
+  webSocket.begin(wsHost, wsPort, wsPath);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+  
+  // Optional: add extra headers
+  webSocket.setExtraHeaders("ESP32-Device: RadarAndFace");
+  
+  Serial.println("WebSocket client configured");
+}
+
+// WebSocket event handler
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("WebSocket disconnected");
+      websocketConnected = false;
+      break;
+    
+    case WStype_CONNECTED:
+      Serial.println("WebSocket connected");
+      websocketConnected = true;
+      
+      // Send initial status
+      sendMessage("ESP32 CAM System connected via WebSocket");
+      break;
+    
+    case WStype_TEXT:
+      // Handle incoming message
+      handleIncomingMessage(payload, length);
+      break;
+  }
+}
+
+// Handle incoming WebSocket messages
+void handleIncomingMessage(uint8_t * payload, size_t length) {
+  // Convert payload to string for easier handling
+  String message = String((char*)payload);
+  Serial.print("Received message: ");
+  Serial.println(message);
+  
+  // Parse JSON message
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, message);
+  
+  if (error) {
+    Serial.print("JSON parsing failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  // Process command from server
+  String command = doc["command"].as<String>();
+  
+  if (command == "SHOOT") {
+    // Activate shoot mode
+    isShootMode = true;
+    shootModeStartTime = currentMillis;
+    sendMessage("SHOOT command activated");
+  }
+  else if (command == "SET_ANGLE") {
+    // Set radar servo angle
+    int angle = doc["angle"];
+    if (angle >= MIN_RADAR_ANGLE && angle <= MAX_RADAR_ANGLE) {
+      radarServo.write(angle);
+      currentRadarAngle = angle;
+      
+      // Send confirmation
+      DynamicJsonDocument response(128);
+      response["type"] = "angle_set";
+      response["angle"] = angle;
+      sendJsonMessage(response);
+    }
+  }
+  else if (command == "TRACK" && objectDetected) {
+    // Handle tracking coordinates
+    int x_axis = doc["x"];
+    int y_axis = doc["y"];
+    
+    // Update tracking data
+    inputString = String(x_axis) + "," + String(y_axis);
+    lastCommandTime = currentMillis;
+    
+    // Process in faceTrackingMode()
+    faceTrackingMode();
+  }
+}
+
+// Replace Serial commands with WebSocket communication
+void checkWebSocketCommands() {
+  // Nothing to do here as commands are now handled in webSocketEvent
+}
+
+// Modified radarScanMode to use WebSocket
 void radarScanMode() {
   // Duy trì hướng quét hiện tại (không cần reset về 15 độ)
   if (radarSweepDirection > 0) {
@@ -180,7 +314,7 @@ void radarScanMode() {
       
       distance = calculateDistance(); // Get distance reading
       
-      // Gửi dữ liệu góc và khoảng cách
+      // Send radar data via WebSocket instead of Serial
       sendRadarData(i, distance);
       
       // Check if an object is detected - with debounce
@@ -198,12 +332,12 @@ void radarScanMode() {
             lastCommandTime = currentMillis; // Initialize command timer
             lastDetectedAngle = i; // Save the angle where the object was detected
             
-            // Stop radar and fully switch to face tracking mode
-            Serial.print("Object detected at angle ");
-            Serial.print(i);
-            Serial.print(" and distance ");
-            Serial.print(distance);
-            Serial.println(" cm, switching to face tracking mode");
+            // Notify via WebSocket instead of Serial
+            DynamicJsonDocument doc(256);
+            doc["type"] = "object_detected";
+            doc["angle"] = i;
+            doc["distance"] = distance;
+            sendJsonMessage(doc);
             
             // Stop the radar servo at current position
             // No more radar movement until timeout
@@ -221,8 +355,8 @@ void radarScanMode() {
         }
       }
       
-      // Kiểm tra lệnh từ Serial trong khi quét
-      checkSerialCommands();
+      // Check for WebSocket messages while scanning
+      webSocket.loop();
     }
     
     // Đã đến giới hạn, đổi hướng
@@ -240,7 +374,7 @@ void radarScanMode() {
       
       distance = calculateDistance(); // Get distance reading
       
-      // Gửi dữ liệu góc và khoảng cách
+      // Send radar data via WebSocket instead of Serial
       sendRadarData(i, distance);
       
       // Check if an object is detected - with debounce
@@ -258,12 +392,12 @@ void radarScanMode() {
             lastCommandTime = currentMillis; // Initialize command timer
             lastDetectedAngle = i; // Save the angle where the object was detected
             
-            // Stop radar and fully switch to face tracking mode
-            Serial.print("Object detected at angle ");
-            Serial.print(i);
-            Serial.print(" and distance ");
-            Serial.print(distance);
-            Serial.println(" cm, switching to face tracking mode");
+            // Notify via WebSocket instead of Serial
+            DynamicJsonDocument doc(256);
+            doc["type"] = "object_detected";
+            doc["angle"] = i;
+            doc["distance"] = distance;
+            sendJsonMessage(doc);
             
             // Stop the radar servo at current position
             // No more radar movement until timeout
@@ -281,8 +415,8 @@ void radarScanMode() {
         }
       }
       
-      // Kiểm tra lệnh từ Serial trong khi quét
-      checkSerialCommands();
+      // Check for WebSocket messages while scanning
+      webSocket.loop();
     }
     
     // Đã đến giới hạn, đổi hướng
@@ -290,20 +424,30 @@ void radarScanMode() {
   }
 }
 
-// Hàm riêng để gửi dữ liệu góc và khoảng cách
+// Send radar data via WebSocket
 void sendRadarData(int angle, int dist) {
+  if (websocketConnected) {
+    DynamicJsonDocument doc(128);
+    doc["type"] = "radar";
+    doc["angle"] = angle;
+    doc["distance"] = dist;
+    doc["direction"] = radarSweepDirection;
+    
+    sendJsonMessage(doc);
+  }
+  
+  // Also send to Serial for debugging
   Serial.print(angle);
   Serial.print(",");
   Serial.print(dist);
   Serial.print(".");
-  
-  // Thêm thông tin hướng quét để web app dễ theo dõi
   Serial.print(" DIR:");
   Serial.println(radarSweepDirection);
 }
 
+// Modified faceTrackingMode to use WebSocket
 void faceTrackingMode() {
-  // Parse coordinates (đã được đọc trong checkSerialCommands)
+  // Parse coordinates
   if (inputString.length() > 0 && inputString.indexOf(',') > 0) {
     int x_axis = inputString.substring(0, inputString.indexOf(',')).toInt();
     int y_axis = inputString.substring(inputString.indexOf(',') + 1).toInt();
@@ -316,15 +460,41 @@ void faceTrackingMode() {
     left_right.write(x);
     up_down.write(y);
     
-    // Send feedback
-    Serial.print("Face tracking - X: ");
-    Serial.print(x);
-    Serial.print(", Y: ");
-    Serial.println(y);
+    // Send feedback via WebSocket
+    DynamicJsonDocument doc(128);
+    doc["type"] = "tracking";
+    doc["x"] = x;
+    doc["y"] = y;
+    sendJsonMessage(doc);
     
     // Clear input string
     inputString = "";
   }
+}
+
+// Helper function to send JSON messages via WebSocket
+void sendJsonMessage(DynamicJsonDocument &doc) {
+  if (websocketConnected) {
+    String jsonString;
+    serializeJson(doc, jsonString);
+    webSocket.sendTXT(jsonString);
+  }
+}
+
+// Helper function to send simple text messages
+void sendMessage(const String &message) {
+  if (websocketConnected) {
+    DynamicJsonDocument doc(256);
+    doc["type"] = "message";
+    doc["content"] = message;
+    
+    String jsonString;
+    serializeJson(doc, jsonString);
+    webSocket.sendTXT(jsonString);
+  }
+  
+  // Also print to Serial for debugging
+  Serial.println(message);
 }
 
 int calculateDistance() {
