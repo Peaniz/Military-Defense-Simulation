@@ -24,7 +24,7 @@ const char* ssid = "Thu Nam";     // Replace with your WiFi SSID
 const char* password = "thunam12345"; // Replace with your WiFi password
 
 // WebSocket server settings
-const char* wsHost = "192.168.1.100";    // Replace with your server IP address
+const char* wsHost = "192.168.1.13";    // Replace with your server IP address
 const uint16_t wsPort = 8000;            // Server port
 const char* wsPath = "/ws/esp32";        // WebSocket path
 
@@ -332,12 +332,8 @@ void radarScanMode() {
             lastCommandTime = currentMillis; // Initialize command timer
             lastDetectedAngle = i; // Save the angle where the object was detected
             
-            // Notify via WebSocket instead of Serial
-            DynamicJsonDocument doc(256);
-            doc["type"] = "object_detected";
-            doc["angle"] = i;
-            doc["distance"] = distance;
-            sendJsonMessage(doc);
+            // Thay thế phần gửi thông báo trực tiếp bằng hàm mới
+            sendObjectDetectionNotification(i, distance);
             
             // Stop the radar servo at current position
             // No more radar movement until timeout
@@ -392,12 +388,8 @@ void radarScanMode() {
             lastCommandTime = currentMillis; // Initialize command timer
             lastDetectedAngle = i; // Save the angle where the object was detected
             
-            // Notify via WebSocket instead of Serial
-            DynamicJsonDocument doc(256);
-            doc["type"] = "object_detected";
-            doc["angle"] = i;
-            doc["distance"] = distance;
-            sendJsonMessage(doc);
+            // Thay thế phần gửi thông báo trực tiếp bằng hàm mới
+            sendObjectDetectionNotification(i, distance);
             
             // Stop the radar servo at current position
             // No more radar movement until timeout
@@ -495,6 +487,32 @@ void sendMessage(const String &message) {
   
   // Also print to Serial for debugging
   Serial.println(message);
+}
+
+// Hàm thông báo phát hiện đối tượng - Đã được cải thiện để đảm bảo distance chính xác
+void sendObjectDetectionNotification(int angle, int distance) {
+  if (websocketConnected) {
+    // Tạo JSON rõ ràng với distance được chỉ định rõ
+    DynamicJsonDocument doc(256);
+    doc["type"] = "object_detected";
+    doc["angle"] = angle;
+    doc["distance"] = distance;  // Đảm bảo distance được gửi đi với giá trị cụ thể
+    
+    // Ghi log trước khi gửi để debug
+    Serial.print("Object detected! Sending detection: angle=");
+    Serial.print(angle);
+    Serial.print(", distance=");
+    Serial.println(distance);
+    
+    // Gửi JSON qua WebSocket
+    sendJsonMessage(doc);
+  }
+  
+  // Ghi log Serial cho debug
+  Serial.print("Object detected at angle ");
+  Serial.print(angle);
+  Serial.print(" distance ");
+  Serial.println(distance);
 }
 
 int calculateDistance() {

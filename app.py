@@ -295,27 +295,54 @@ class CameraThread(threading.Thread):
         global serial_port, system_message, esp32_client
         
         try:
+            # Tính toán trung tâm khung hình
+            center_x = frame_width / 2
+            center_y = frame_height / 2
+            
+            # Tính độ lệch của đối tượng so với trung tâm
+            offset_x = x - center_x
+            offset_y = y - center_y
+            
+            # Giảm độ lệch xuống 30% cho X, 50% cho Y để servo di chuyển chậm hơn
+            # Tăng hệ số cho Y để đảm bảo nó di chuyển
+            reduced_offset_x = offset_x * 0.4
+            reduced_offset_y = offset_y * 1 # Tăng từ 0.3 lên 0.5
+            
+            # Tính tọa độ mới dựa trên trung tâm và độ lệch đã giảm
+            adjusted_x = center_x + reduced_offset_x
+            
+            # Đảo ngược chiều Y vì có thể servo Y cần xoay ngược lại
+            adjusted_y = center_y + reduced_offset_y  # Đảo dấu từ + thành -
+            
+            # Thêm offset 10% để camera nhìn thấp hơn (điều chỉnh dấu phù hợp với hướng)
+            y_offset = frame_height * 0.1
+            adjusted_y = adjusted_y - y_offset  # Đảo dấu để phù hợp với hướng mới
+            
+            # Debug thông tin
+            # print(f"Original: ({x}, {y}), Center: ({center_x}, {center_y}), Offsets: ({offset_x}, {offset_y})")
+            print(f"Final adjusted: ({adjusted_x}, {adjusted_y})")
+            
             if USE_WEBSOCKET and esp32_client is not None:
                 # Send coordinates via WebSocket
                 message = {
                     "command": "TRACK",
-                    "x": int(x),
-                    "y": int(y)
+                    "x": int(adjusted_x),
+                    "y": int(adjusted_y)
                 }
                 asyncio.run_coroutine_threadsafe(
                     esp32_client.send_text(json.dumps(message)), 
                     main_event_loop
                 )
-                system_message = f"Tracking via WebSocket: X={int(x)}, Y={int(y)}"
+                system_message = f"Tracking via WebSocket: X={int(adjusted_x)}, Y={int(adjusted_y)} (Y reversed)"
                 print(system_message)
             # Fallback to Serial if WebSocket not available
             elif not USE_WEBSOCKET and serial_port is not None and serial_port.is_open:
                 # Get lock to prevent simultaneous access
                 with serial_lock:
-                    coordinates = f"{int(x)},{int(y)}\r"
+                    coordinates = f"{int(adjusted_x)},{int(adjusted_y)}\r"
                     serial_port.write(coordinates.encode())
-                    print(f"Sent to ESP32 via Serial: X={int(x)}, Y={int(y)}")
-                    system_message = f"Tracking: X={int(x)}, Y={int(y)}"
+                    print(f"Sent to ESP32 via Serial: X={int(adjusted_x)}, Y={int(adjusted_y)} (Y reversed)")
+                    system_message = f"Tracking: X={int(adjusted_x)}, Y={int(adjusted_y)} (Y reversed)"
             else:
                 system_message = "No connection to ESP32 available"
         except Exception as e:
@@ -448,75 +475,81 @@ async def read_serial():
                         # Ensure we parse it correctly
                         try:
                             # Get portion before the dot
-                            radar_data = radar_data.split('.')[0].strip()
+                            print(f"DEBUG - Parsing radar data: '{radar_data}'")
+                            
+                            # Xử lý dữ liệu khác nhau
+                            if '.' in radar_data:
+                                radar_data = radar_data.split('.')[0].strip()
                             
                             if ',' in radar_data:
                                 parts = radar_data.split(',')
+                                print(f"DEBUG - Split parts: {parts}")
+                                
                                 if len(parts) >= 2:
                                     try:
-                                        new_angle = int(parts[0])
-                                        new_distance = int(parts[1])
+                                        # Loại bỏ các ký tự không phải số từ phần tử đầu tiên và thứ hai
+                                        # Đảm bảo chỉ lấy số từ chuỗi
+                                        angle_str = ''.join(c for c in parts[0] if c.isdigit() or c == '-')
+                                        distance_str = ''.join(c for c in parts[1] if c.isdigit() or c == '-')
                                         
-                                        # Thời gian nhận dữ liệu radar
-                                        current_time = time.time()
-                                        last_radar_data_time = current_time
-                                        
-                                        # Kiểm tra nếu góc thay đổi, đánh dấu radar đang di chuyển
-                                        if abs(last_received_angle - new_angle) > 1:
-                                            radar_moving = True
-                                            consecutive_static_updates = 0  # Reset bộ đếm
-                                            print(f"Radar is moving. Angle changed from {last_received_angle} to {new_angle}")
+                                        if angle_str and distance_str:
+                                            new_angle = int(angle_str)
+                                            new_distance = int(distance_str)
                                             
-                                            # Determine radar direction based on angle change
-                                            if new_angle > last_received_angle:
-                                                radar_direction = 1  # Increasing angles (e.g., 15 to 165)
+                                            print(f"DEBUG - Extracted values: angle={new_angle}, distance={new_distance}")
+                                            
+                                            # Kiểm tra giới hạn hợp lý
+                                            if new_angle < 0 or new_angle > 180:
+                                                print(f"WARNING: Invalid angle: {new_angle}, clamping to range")
+                                                new_angle = max(MIN_RADAR_ANGLE, min(MAX_RADAR_ANGLE, new_angle))
+                                            
+                                            if new_distance <= 0:
+                                                print(f"WARNING: Invalid distance: {new_distance}, using default")
+                                                new_distance = 100  # Giá trị an toàn mặc định
+                                            elif new_distance > 500:  # Giới hạn khoảng cách tối đa
+                                                print(f"WARNING: Distance too large: {new_distance}, clamping")
+                                                new_distance = 500
+                                            
+                                            # Thời gian nhận dữ liệu radar
+                                            current_time = time.time()
+                                            last_radar_data_time = current_time
+                                            
+                                            # Kiểm tra nếu góc thay đổi, đánh dấu radar đang di chuyển
+                                            if abs(last_received_angle - new_angle) > 1:
+                                                radar_moving = True
+                                                consecutive_static_updates = 0  # Reset bộ đếm
+                                                print(f"Radar is moving. Angle changed from {last_received_angle} to {new_angle}")
+                                                
+                                                # Determine radar direction based on angle change
+                                                if new_angle > last_received_angle:
+                                                    radar_direction = 1  # Increasing angles (e.g., 15 to 165)
+                                                else:
+                                                    radar_direction = -1  # Decreasing angles (e.g., 165 to 15)
                                             else:
-                                                radar_direction = -1  # Decreasing angles (e.g., 165 to 15)
-                                        else:
-                                            # Góc không thay đổi, tăng bộ đếm
-                                            consecutive_static_updates += 1
+                                                # Góc không thay đổi, tăng bộ đếm
+                                                consecutive_static_updates += 1
+                                                
+                                                # Nếu nhận được nhiều cập nhật liên tiếp với cùng một góc, có thể servo đang dừng
+                                                if consecutive_static_updates > 5:
+                                                    radar_moving = False
+                                                    print(f"Radar stopped. Angle stable at {new_angle}")
                                             
-                                            # Nếu nhận được nhiều cập nhật liên tiếp với cùng một góc, có thể servo đang dừng
-                                            if consecutive_static_updates > 5:
-                                                radar_moving = False
-                                                print(f"Radar stopped. Angle stable at {new_angle}")
-                                        
-                                        # Lưu góc nhận được để so sánh lần sau
-                                        last_received_angle = new_angle
-                                        
-                                        # Always update radar values
-                                        radar_angle = new_angle
-                                        radar_distance = new_distance
-                                        last_serial_update_time = current_time
-                                        
-                                        # Enforce limits
-                                        if radar_angle < MIN_RADAR_ANGLE:
-                                            radar_angle = MIN_RADAR_ANGLE
-                                        elif radar_angle > MAX_RADAR_ANGLE:
-                                            radar_angle = MAX_RADAR_ANGLE
+                                            # Lưu góc nhận được để so sánh lần sau
+                                            last_received_angle = new_angle
                                             
-                                        # Check if we should highlight potential object detection
-                                        detection_highlight = radar_distance < DETECTION_DISTANCE
-                                        
-                                        # IMPORTANT: Always broadcast to ensure radar moves
-                                        await broadcast_message(json.dumps({
-                                            "type": "radar",
-                                            "angle": radar_angle,
-                                            "distance": radar_distance,
-                                            "mode": mode,
-                                            "direction": radar_direction,
-                                            "detection": detection_highlight,
-                                            "moving": radar_moving,
-                                            "timestamp": current_time
-                                        }))
-                                        
-                                        if waiting_for_first_radar_data and mode == "RADAR":
-                                            waiting_for_first_radar_data = False
-                                            system_message = "✅ Radar data received from ESP32, resuming normal operation"
-                                            print("✅ First radar data received after mode switch - unfreezing radar")
+                                            # Always update radar values
+                                            radar_angle = new_angle
+                                            radar_distance = new_distance
+                                            last_serial_update_time = current_time
                                             
-                                            # Update detection_highlight correctly using is_object_detected
-                                            is_object_detected = detection_highlight
+                                            # Enforce limits
+                                            if radar_angle < MIN_RADAR_ANGLE:
+                                                radar_angle = MIN_RADAR_ANGLE
+                                            elif radar_angle > MAX_RADAR_ANGLE:
+                                                radar_angle = MAX_RADAR_ANGLE
+                                                
+                                            # Check if we should highlight potential object detection
+                                            detection_highlight = radar_distance < DETECTION_DISTANCE
                                             
                                             # IMPORTANT: Always broadcast to ensure radar moves
                                             await broadcast_message(json.dumps({
@@ -527,11 +560,31 @@ async def read_serial():
                                                 "direction": radar_direction,
                                                 "detection": detection_highlight,
                                                 "moving": radar_moving,
-                                                "timestamp": current_time,
-                                                "first_data_after_switch": True,
-                                                "resume_animation": True  # Tell frontend to resume animation
+                                                "timestamp": current_time
                                             }))
-                                        
+                                            
+                                            if waiting_for_first_radar_data and mode == "RADAR":
+                                                waiting_for_first_radar_data = False
+                                                system_message = "✅ Radar data received from ESP32, resuming normal operation"
+                                                print("✅ First radar data received after mode switch - unfreezing radar")
+                                                
+                                                # Update detection_highlight correctly using is_object_detected
+                                                is_object_detected = detection_highlight
+                                                
+                                                # IMPORTANT: Always broadcast to ensure radar moves
+                                                await broadcast_message(json.dumps({
+                                                    "type": "radar",
+                                                    "angle": radar_angle,
+                                                    "distance": radar_distance,
+                                                    "mode": mode,
+                                                    "direction": radar_direction,
+                                                    "detection": detection_highlight,
+                                                    "moving": radar_moving,
+                                                    "timestamp": current_time,
+                                                    "first_data_after_switch": True,
+                                                    "resume_animation": True  # Tell frontend to resume animation
+                                                }))
+                                            
                                     except ValueError:
                                         print(f"Error parsing values: '{parts}'")
                                         pass  # Ignore invalid data
@@ -884,9 +937,31 @@ async def esp32_websocket_endpoint(websocket: WebSocket):
                 # Process based on message type
                 if message_type == "radar":
                     # Update radar data
-                    new_angle = json_data.get("angle", radar_angle)
-                    new_distance = json_data.get("distance", radar_distance)
-                    new_direction = json_data.get("direction", radar_direction)
+                    print(f"DEBUG - Received radar data: {json_data}")
+                    
+                    # Đảm bảo đọc đúng dữ liệu radar
+                    if "angle" in json_data:
+                        new_angle = json_data.get("angle")
+                    else:
+                        new_angle = radar_angle
+                        print(f"WARNING: No angle in radar data, using current angle: {new_angle}")
+                    
+                    if "distance" in json_data:
+                        new_distance = json_data.get("distance")
+                        # Đảm bảo giá trị distance hợp lệ
+                        if new_distance == 0 or new_distance > 400:
+                            print(f"WARNING: Invalid distance value: {new_distance}, using previous value")
+                            new_distance = radar_distance if radar_distance > 0 else 100
+                    else:
+                        new_distance = radar_distance if radar_distance > 0 else 100
+                        print(f"WARNING: No distance in radar data, using previous value: {new_distance}")
+                    
+                    if "direction" in json_data:
+                        new_direction = json_data.get("direction")
+                    else:
+                        new_direction = radar_direction
+                    
+                    print(f"Processed radar data: angle={new_angle}, distance={new_distance}, direction={new_direction}")
                     
                     # Record time of data receipt
                     current_time = time.time()
@@ -957,15 +1032,66 @@ async def esp32_websocket_endpoint(websocket: WebSocket):
                 
                 elif message_type == "object_detected":
                     # Object detected by ESP32
-                    detected_angle = json_data.get("angle", 90)
-                    detected_distance = json_data.get("distance", 0)
+                    print(f"\n\n==== OBJECT DETECTION EVENT ====")
+                    print(f"RAW data: {json_data}")
+                    print(f"Current radar values: angle={radar_angle}, distance={radar_distance}")
                     
-                    # Notify clients
-                    await broadcast_message(json.dumps({
+                    # Lưu trực tiếp các giá trị gốc để debug
+                    raw_angle = json_data.get("angle")
+                    raw_distance = json_data.get("distance")
+                    print(f"Raw JSON fields: angle={raw_angle}, distance={raw_distance}")
+                    
+                    # Xác định góc
+                    if "angle" in json_data:
+                        detected_angle = json_data.get("angle")
+                    else:
+                        detected_angle = radar_angle
+                        print(f"Using current radar angle: {detected_angle}")
+                        
+                    # QUAN TRỌNG: Xử lý khoảng cách một cách rõ ràng
+                    # Ưu tiên giá trị từ thông điệp object_detected
+                    if "distance" in json_data and json_data["distance"] is not None:
+                        raw_val = json_data["distance"]
+                        print(f"Distance found in message: {raw_val} (type: {type(raw_val)})")
+                        
+                        # Xử lý chuyển đổi kiểu an toàn
+                        try:
+                            if isinstance(raw_val, (int, float)):
+                                detected_distance = int(raw_val)
+                            elif isinstance(raw_val, str) and raw_val.strip():
+                                detected_distance = int(raw_val)
+                            else:
+                                raise ValueError(f"Invalid distance format: {raw_val}")
+                                
+                            print(f"Successfully parsed distance: {detected_distance}")
+                        except (ValueError, TypeError) as e:
+                            print(f"Error parsing distance value '{raw_val}': {e}")
+                            # Dự phòng: Sử dụng radar_distance nếu hợp lệ, nếu không dùng giá trị mặc định
+                            detected_distance = radar_distance if radar_distance > 0 else 30
+                    else:
+                        print("No distance in detection message, using radar_distance")
+                        detected_distance = radar_distance if radar_distance > 0 else 30
+                    
+                    # Đảm bảo distance luôn có giá trị hợp lệ
+                    if detected_distance <= 0:
+                        print(f"Invalid distance value: {detected_distance}, using default")
+                        detected_distance = 30  # Giá trị mặc định
+                    
+                    # Giới hạn khoảng cách trong phạm vi hợp lý
+                    detected_distance = max(5, min(400, detected_distance))
+                    
+                    print(f"FINAL detection values: angle={detected_angle}, distance={detected_distance}")
+                    print(f"==== END DETECTION EVENT ====\n\n")
+                    
+                    # Notify clients with corrected values - LƯU Ý: DISTANCE LUÔN ĐƯỢC BAO GỒM
+                    detection_message = {
                         "type": "object_detected",
                         "angle": detected_angle,
-                        "distance": detected_distance
-                    }))
+                        "distance": detected_distance  # Đảm bảo luôn có giá trị
+                    }
+                    
+                    print(f"Broadcasting to clients: {detection_message}")
+                    await broadcast_message(json.dumps(detection_message))
                     
                     # Wait briefly then switch to tracking
                     await asyncio.sleep(0.3)
